@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pio/
+cards/out/
+*.bin
+*.elf
+*.map
+data/

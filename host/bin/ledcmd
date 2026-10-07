@@ -1,0 +1,3 @@
+#!/bin/sh
+# 手动给状态灯发一条指令（调试用）: ledcmd IDLE|BUSY|OK|WARN|ERROR|BOOT|REGION|CANCEL
+printf "%s\n" "$1" > /dev/ttyACM0

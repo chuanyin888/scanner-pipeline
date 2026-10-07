@@ -1,0 +1,16 @@
+[Unit]
+Description=Region Sorter (enter: QR cards -> region folders)
+After=scanner.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/scanner/sorter.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

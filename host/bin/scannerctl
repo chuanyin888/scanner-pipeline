@@ -1,0 +1,57 @@
+#!/bin/bash
+# 流水线高拍仪抓拍系统 现场操作脚本
+set -u
+
+DAEMON=/opt/scanner/scanner_daemon.py
+DATA=/opt/scanner/data
+
+usage() {
+    cat <<'EOT'
+用法: scannerctl <命令>
+  status     查看设备 / 关键控制项 / 实时状态
+  logs       实时跟踪抓拍日志 (Ctrl+C 退出)
+  snapshot   立刻抓一张样张到 /opt/scanner/data/，验证画面与清晰度
+  self-test  写盘链路自检 (不动物品，生成两张测试图并校验后删除)
+  focus      自动扫焦标定(请先把一个典型设备放在底板上, 全程不要动, 约 30 秒)
+  recalibrate 重新标定空台背景(请先把台面清空, 然后执行本命令)
+  files      列出最近抓拍的 20 张图
+EOT
+}
+
+case "${1:-}" in
+    status)
+        python3 "$DAEMON" --check
+        echo "--- 实时状态 ---"
+        cat /opt/scanner/status.json 2>/dev/null || echo "服务未运行或还没写出状态"
+        echo
+        ;;
+    logs)
+        exec journalctl -u scanner.service -f -o cat
+        ;;
+    snapshot)
+        systemctl stop scanner.service
+        python3 "$DAEMON" --snapshot "$DATA/preview_$(date +%Y%m%d_%H%M%S).jpg"
+        systemctl start scanner.service
+        echo "样张已保存, 可用 status 查看服务是否恢复"
+        ;;
+    self-test)
+        python3 "$DAEMON" --self-test
+        ;;
+    focus)
+        echo ">> 请确认底板上已放好典型设备, 扫描期间不要移动/拿走 ..."
+        systemctl stop scanner.service
+        python3 /opt/scanner/focus_sweep.py
+        systemctl start scanner.service
+        echo ">> 新对焦值已存档, 服务已重启并复用该值"
+        ;;
+    recalibrate)
+        touch /opt/scanner/recalibrate.flag
+        echo ">> 已请求重新标定空台背景, 1-2 秒内生效(确认台面已清空)"
+        ;;
+    files)
+        find "$DATA" -name '*.jpg' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -20 | cut -d' ' -f2-
+        ;;
+    *)
+        usage
+        ;;
+esac

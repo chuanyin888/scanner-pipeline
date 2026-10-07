@@ -1,0 +1,17 @@
+[Unit]
+Description=Scanner Status LED Bridge (ESP32 over USB serial)
+After=scanner.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/scanner
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/scanner/led_bridge.py
+Restart=always
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
