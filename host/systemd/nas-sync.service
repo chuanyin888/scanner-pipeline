@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync scanner data to NAS (入库数据)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/scanner/nas_sync.py
+Nice=10
+IOSchedulingClass=idle

@@ -105,18 +105,44 @@ def make_cancel_card(out_png):
     return img
 
 
+def make_big_card(label, out_png, payload):
+    """大码版：二维码几乎占满整张（正方形），适合手机显示或放大打印.
+
+    小码+偏位+虚焦时扫码器解不出来（实测过），大码能大幅提高成功率。
+    """
+    side = 2000
+    img = Image.new("RGB", (side, side + 260), "white")
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=1)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_img = qr_img.resize((side - 40, side - 40), Image.NEAREST)
+    img.paste(qr_img, (20, 20))
+    f = load_font(150)
+    d = ImageDraw.Draw(img)
+    box = d.textbbox((0, 0), label, font=f)
+    d.text(((side - (box[2] - box[0])) // 2 - box[0], side + 40), label, font=f, fill="black")
+    img.save(out_png, dpi=(300, 300))
+    return img
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("regions", nargs="*", help="区域名，例如 江北区 江宁区")
     ap.add_argument("--cancel", action="store_true", help="生成一张『取消区域』卡")
+    ap.add_argument("--big", action="store_true", help="生成大码版（二维码占满整页，适合手机显示）")
     ap.add_argument("--interactive", action="store_true", help="交互式输入区域名")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "out"))
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
     if args.cancel:
-        png = os.path.join(args.out, "取消区域卡.png")
-        make_cancel_card(png)
+        if args.big:
+            png = os.path.join(args.out, "取消区域卡_大码.png")
+            make_big_card("取消区域", png, "enter:cancel")
+        else:
+            png = os.path.join(args.out, "取消区域卡.png")
+            make_cancel_card(png)
         print(f"已生成: {png}")
         return 0
 
@@ -131,6 +157,13 @@ def main():
         args.regions = line.split()
 
     pages = []
+    if args.big:
+        for name in args.regions:
+            safe = name.strip().replace("/", "_").replace("\\", "_")
+            png = os.path.join(args.out, f"区域卡_{safe}_大码.png")
+            make_big_card(safe, png, "enter:" + quote(safe, safe=""))
+            print(f"已生成: {png}")
+        return 0
     for name in args.regions:
         safe = name.strip().replace("/", "_").replace("\\", "_")
         png = os.path.join(args.out, f"区域卡_{safe}.png")

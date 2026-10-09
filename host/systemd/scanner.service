@@ -1,6 +1,5 @@
 [Unit]
 Description=Automated High-Speed Inventory Scanner
-After=multi-user.target
 StartLimitIntervalSec=0
 
 [Service]

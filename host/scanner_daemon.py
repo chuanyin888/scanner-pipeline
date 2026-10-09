@@ -66,6 +66,8 @@ CFG = {
     "sharpness_warn": 100,    # 抓拍清晰度低于此值就提醒重标定
     "plate_bright_limit": 5.0,  # 中心区亮像素(>150)占比低于此值 且 清晰度低 = 空台
     "plate_sharp_limit": 300,   # 实测: 空底板清晰度≈124, 深色电路板≈667, 白色光猫≈1400+
+    "empty_ncc": 0.90,          # 与空台的结构相关度高于此值 且 平均差很小 => 就是空台（实测 空台0.975 / 光猫0.632 / 手机0.246）
+    "empty_mean_abs": 9.0,
     # 自适应与自愈
     "bg_adapt_rate": 0.02,    # 空台时背景缓慢适应(抗灯光/落灰漂移)
     "read_fail_limit": 40,    # 连续读帧失败 -> 重连设备
@@ -322,6 +324,26 @@ def frame_is_plate(frame, cfg=CFG):
     return frame_sharpness(frame) < cfg["plate_sharp_limit"]
 
 
+def is_empty_like(frame, bg, cfg=CFG):
+    """判断画面是不是"就是空台"（即使自动曝光漂移导致整体亮度不同）.
+
+    做法：两边各自减去平均亮度后算归一化互相关（NCC）。
+    纯曝光/光线变化只会让亮度整体平移，NCC 依旧很高；
+    真放了东西结构就变了，NCC 会明显下降。
+    """
+    g = detect_view(frame, cfg)
+    if g.shape != bg.shape:
+        return False
+    a = g.astype("float32")
+    b = bg.astype("float32")
+    a -= float(a.mean())
+    b -= float(b.mean())
+    denom = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum())) + 1e-6
+    ncc = float((a * b).sum()) / denom
+    mean_abs = float(np.abs(a - b).mean())
+    return ncc > cfg["empty_ncc"] and mean_abs < cfg["empty_mean_abs"]
+
+
 # -------------------- 写盘线程 --------------------
 def writer_worker(cfg=CFG):
     while True:
@@ -561,10 +583,14 @@ def run_loop(cfg=CFG):
                 if not moving:
                     stable += 1
                     if stable >= cfg["stable_frames"] and now - last_capture >= cfg["min_capture_gap"]:
-                        path = enqueue_capture(frame, cfg)
-                        if path:
-                            last_capture = now
-                            log(f"画面静止 {stable} 帧, 已投递抓拍: {os.path.basename(path)}")
+                        if is_empty_like(frame, bg, cfg):
+                            # 空台被自动曝光漂移"伪装"成物品时不再拍下来（用户要求：空台不必留图）
+                            log("画面与空台一致（曝光漂移误触发），跳过保存")
+                        else:
+                            path = enqueue_capture(frame, cfg)
+                            if path:
+                                last_capture = now
+                                log(f"画面静止 {stable} 帧, 已投递抓拍: {os.path.basename(path)}")
                         state = "CAPTURED"
                         stable = 0
                 else:

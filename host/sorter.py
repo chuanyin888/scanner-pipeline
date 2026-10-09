@@ -26,9 +26,12 @@ import time
 from datetime import datetime
 from urllib.parse import unquote
 
+import cv2
+
 DATA_DIR = "/opt/scanner/data"
 STATE_FILE = "/opt/scanner/current_region.json"
 STATS_FILE = "/opt/scanner/region_stats.json"
+SWITCH_LOG = "/opt/scanner/region_history.log"
 SWITCH_DIR = "_切换记录"
 UNSORTED = "未分拣"
 
@@ -80,13 +83,18 @@ def stats_add(region):
     save_json(STATS_FILE, stats)
 
 
-# ---------------- 二维码 ----------------
-def decode_qr(path):
-    """用 zbarimg 取二维码**原始字节**再自己解码.
+def log_switch(text):
+    """区域切换留痕（只写一行文字，不留卡片照片）."""
+    try:
+        with open(SWITCH_LOG, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
+    except OSError as exc:
+        log(f"切换记录写入失败: {exc}")
 
-    注意: 普通的 zbarimg 会把二维码内容按日文 Shift-JIS 解释, 中文会变乱码
-    （实测 "江北区" -> "豎溷圏蛹ｺ"）; 加 -Sbinary 才是原样字节.
-    """
+
+# ---------------- 二维码 ----------------
+def _zbar(path):
+    """调 zbarimg 取**原始字节**（加 -Sbinary，否则中文会被按日文 Shift-JIS 解释成乱码）."""
     try:
         proc = subprocess.run(
             ["zbarimg", "-q", "--raw", "-Sbinary", "-Sdisable", "-Sqrcode.enable", path],
@@ -106,6 +114,64 @@ def decode_qr(path):
             except UnicodeDecodeError:
                 continue
     return texts
+
+
+def _prep(img, mode):
+    """生成预处理图：小码 / 虚码 / 手机屏幕码都能多一次机会."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    if mode == "clahe1x":
+        return cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+    if mode == "clahe2x":
+        g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
+        return cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    if mode == "center3x":
+        h, w = gray.shape
+        crop = gray[int(h * 0.2) : int(h * 0.92), int(w * 0.2) : int(w * 0.92)]
+        g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(crop)
+        return cv2.resize(g, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    if mode == "center2x":
+        h, w = gray.shape
+        crop = gray[int(h * 0.2) : int(h * 0.92), int(w * 0.2) : int(w * 0.92)]
+        g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(crop)
+        return cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    if mode == "corner3x":
+        h, w = gray.shape
+        crop = gray[int(h * 0.28) : int(h * 0.98), int(w * 0.28) : int(w * 0.99)]
+        g = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(crop)
+        return cv2.resize(g, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    if mode == "otsu2x":
+        g = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+        g = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        return cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return gray
+
+
+def decode_qr(path):
+    """先直读；直读失败再走多轮预处理（只对没解出码的照片多花时间）."""
+    texts = _zbar(path)
+    if texts:
+        return texts
+    img = cv2.imread(path)
+    if img is None:
+        return []
+    # 只保留两轮便宜的处理（原来的多轮放大太慢：实测 23 秒/张，会把队列拖住）
+    for mode in ("clahe1x", "center2x"):
+        tmp = f"/dev/shm/qr_{mode}_{os.getpid()}.png"
+        try:
+            cv2.imwrite(tmp, _prep(img, mode))
+            texts = _zbar(tmp)
+        except Exception as exc:  # noqa: BLE001
+            log(f"预处理 {mode} 失败: {exc}")
+            texts = []
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if texts:
+            log(f"（二维码经 {mode} 预处理后解出）")
+            return texts
+    return []
 
 
 def clean_name(raw):
@@ -151,15 +217,15 @@ def handle_photo(path, date_dir):
             return
         if region.lower() in CANCEL_WORDS:
             clear_region()
-            dst = unique_dest(os.path.join(date_dir, SWITCH_DIR), f"取消_{name}")
-            os.replace(path, dst)
-            log(f"区域已取消: 后续照片进 {UNSORTED}/  (卡片照片: {os.path.basename(dst)})")
+            os.remove(path)  # 区域卡不用留图
+            log_switch(f"取消区域（照片 {name} 已删除）")
+            log(f"区域已取消: 后续照片进 {UNSORTED}/（卡片照片未保留）")
             return
         set_region(region)
         os.makedirs(os.path.join(date_dir, region), exist_ok=True)  # 扫卡即建好区域文件夹
-        dst = unique_dest(os.path.join(date_dir, SWITCH_DIR), name)
-        os.replace(path, dst)
-        log(f"区域已切换: {region}  (已建/复用文件夹 {region}/, 卡片照片: {os.path.basename(dst)})")
+        os.remove(path)  # 区域卡不用留图
+        log_switch(f"切换到 {region}（照片 {name} 已删除）")
+        log(f"区域已切换: {region}  (已建/复用文件夹 {region}/，卡片照片未保留)")
         return
 
     if any(LOOKS_LIKE_CARD.match(t) for t in texts):
