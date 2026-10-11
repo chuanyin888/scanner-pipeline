@@ -24,6 +24,10 @@ from datetime import datetime
 SERIAL_GLOBS = ("/dev/ttyUSB*", "/dev/ttyACM*")
 KEEPALIVE_S = 10
 
+# 一次性动画状态：发一次就行，别用心跳反复触发（否则灯会一直闪个不停）
+# 秒数 = 固件里该动画持续多久（WARN/ERROR 固件 30 秒后自动回待命）
+ONESHOT_SECONDS = {"WARN": 31, "ERROR": 31, "REGION": 6, "CANCEL": 4}
+
 RULES = [
     (re.compile(r"检测到放入物品"), "BUSY"),
     (re.compile(r"抓拍完成:.*清晰度\s+(\d+)"), "SHOT"),
@@ -38,10 +42,12 @@ RULES = [
     (re.compile(r"区域已切换"), "REGION"),
     (re.compile(r"区域已取消"), "CANCEL"),
     (re.compile(r"区域卡无效"), "ERROR"),
+    (re.compile(r"疑似区域卡但识别失败"), "WARN"),
 ]
 
 current = None
 last_sent = 0.0
+oneshot_until = 0.0
 
 
 def log(msg):
@@ -84,7 +90,7 @@ class Led:
             return False
 
     def send(self, state, force=False):
-        global current, last_sent
+        global current, last_sent, oneshot_until
         if not self.ensure():
             return
         if not force and state == current:
@@ -93,6 +99,9 @@ class Led:
             self.fh.write((state + "\n").encode())
             current = state
             last_sent = time.time()
+            oneshot_until = (
+                time.time() + ONESHOT_SECONDS[state] if state in ONESHOT_SECONDS else 0.0
+            )
             log(f"-> {state}")
         except Exception as exc:  # noqa: BLE001
             log(f"串口写失败: {exc}, 断开重连")
@@ -145,7 +154,7 @@ def journal_thread(led):
 
 
 def main():
-    global current
+    global current, oneshot_until
     led = Led()
     log("状态灯桥接服务启动（等待拍照日志 / 串口设备）")
     threading.Thread(target=journal_thread, args=(led,), daemon=True).start()
@@ -162,6 +171,11 @@ def main():
                 elif boot_at and time.time() - boot_at > 3:
                     boot_at = 0.0
                     led.send("IDLE", force=True)
+                elif oneshot_until:
+                    # 一次性动画（告警/区域切换确认）期间不发心跳，避免反复重播
+                    if time.time() > oneshot_until:
+                        oneshot_until = 0.0
+                        led.send("IDLE", force=True)
                 elif time.time() - last_sent > KEEPALIVE_S:
                     led.send(current, force=True)  # 心跳，防止灯重启后丢状态
             elif not waiting_logged:

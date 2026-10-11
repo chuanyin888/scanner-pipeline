@@ -13,7 +13,10 @@
 | 扫焦标定 | `host/focus_sweep.py` | 逐档扫描焦点，用实测清晰度选最锐利值并存档 |
 | 区域分拣 | `host/sorter.py` | 识别 `enter:<区域名>` 二维码卡，照片按区域归档 |
 | 状态灯桥接 | `host/led_bridge.py` | 把上面两个服务的日志事件翻译成串口指令发给 ESP32 |
-| NAS 同步 | `host/nas_sync.py` | 每 5 分钟把抓拍数据推到 NAS；历史日期只写一次并冻结 |
+| NAS 同步 | `host/nas_sync.py` | 每 5 分钟把抓拍数据推到 NAS；历史目录只写一次并冻结，冻结后补录的新照片仍会增量补传 |
+| 手机补录服务 | `host/photo_import.py` | 高拍仪拍不到的高设备：手机拍照/相册上传，直接进「日期/区域」（端口 8090，带运行日志上报） |
+| 手机补录 App | `app/photo-import-app/` | 安卓端连拍上传 App（台数统计、失败重传、运行日志、拍照尺寸 4:3/16:9 可选且预览同步、卡顿自愈） |
+| 图片数量标记 | `host/photo_count.py` | 每个照片文件夹维护"名字=图片数"的 txt，SSH 里一眼看数量（`recount_all.py` 可重算） |
 | 状态灯固件 | `esp32/led_status/` | ESP32-S3 + 板载 WS2812，按状态变色 |
 | 区域卡工具 | `cards/make_card.py` | 输入区域名 → 生成可打印二维码卡（含"取消区域"卡） |
 
@@ -39,15 +42,21 @@ sudo apt-get install -y python3-opencv python3-numpy v4l-utils libv4l-dev zbar-t
 
 ```bash
 sudo mkdir -p /opt/scanner/data /opt/scanner/fw
-sudo cp host/scanner_daemon.py host/focus_sweep.py host/sorter.py host/led_bridge.py /opt/scanner/
+sudo cp host/scanner_daemon.py host/focus_sweep.py host/sorter.py host/led_bridge.py \
+    host/nas_sync.py host/photo_import.py host/photo_count.py host/recount_all.py /opt/scanner/
 sudo cp host/bin/scannerctl host/bin/sorterctl host/bin/ledcmd /usr/local/bin/
 sudo chmod +x /usr/local/bin/scannerctl /usr/local/bin/sorterctl /usr/local/bin/ledcmd
-sudo cp host/systemd/*.service /etc/systemd/system/
+sudo cp host/systemd/*.service host/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now scanner.service sorter.service led-bridge.service
+sudo systemctl enable --now photo-import.service nas-sync.timer    # 手机补录 + NAS 同步（NAS 先挂好，见下文）
 ```
 
 启动前请确认**台面是空的**（空台背景要干净），日志里会提示。
+
+手机补录：手机浏览器打开 `http://<机顶盒IP>:8090/` 可直接拍照上传；安卓 App 源码在
+`app/photo-import-app/`（自行打包后把 APK 放到 `/opt/scanner/app/`，手机访问
+`http://<机顶盒IP>:8090/app.apk` 下载）。
 
 ### 3. 对焦标定（重要）
 
@@ -93,6 +102,7 @@ Windows 上可直接双击 `cards/做区域卡.bat`，按提示输入区域名�
 | `sorterctl --set 江北区` | 手动切换区域（等同扫卡） |
 | `sorterctl --clear` | 取消当前区域 |
 | `sorterctl --move 未分拣 江北区` | 把未分拣整批挪到指定区域 |
+| `python3 /opt/scanner/recount_all.py` | 手动删过照片后，重算全部文件夹的「数量标记」 |
 | `ledcmd REGION` | 手动触发灯效（调试用） |
 
 ## 状态灯约定
@@ -122,6 +132,14 @@ Windows 上可直接双击 `cards/做区域卡.bat`，按提示输入区域名�
 ## 数据目录
 
 ```
+/opt/scanner/data/
+└── 20261007/
+    ├── 江北区/
+    │   ├── SN_20261007_200148_519171.jpg
+    │   └── ...
+    ├── 未分拣/                 # 还没扫区域卡时拍的照片
+    └── _切换记录/              # 区域卡本身的照片
+```
 
 ## NAS 同步（入库数据）
 
@@ -136,6 +154,7 @@ Windows 上可直接双击 `cards/做区域卡.bat`，按提示输入区域名�
 | --- | --- |
 | **当天**目录 | 每轮增量同步，只补新文件 |
 | **历史**日期目录 | 只做一次最终同步 → 校验文件数+字节数 → 写 `/opt/scanner/nas_sync_state.json` 标记 `final` → 以后**永久跳过，不再重写** |
+| **冻结后补录** | 历史目录冻结**之后**新增的文件（手机补录等）会增量补传一次；数量标记 txt、临时文件、日期根目录"待分拣"的照片不会同步 |
 | NAS 未挂载 / 同步失败 | 本轮跳过、不冻结，下一轮自动重试 |
 | 删除 | **只增不删**，绝不动 NAS 上的文件 |
 
@@ -146,14 +165,6 @@ Windows 上可直接双击 `cards/做区域卡.bat`，按提示输入区域名�
 2. "冻结"只是同步脚本自己的状态标记，**不会锁定 NAS 目录**：其它程序照常读写删。
    注意当天目录若在 NAS 上被删除，下一轮会从本机补回来（源文件还在）；要删除当天的图，
    先把它当历史（第二天）处理，或手动在状态文件里标记 `final`。
-/opt/scanner/data/
-└── 20261007/
-    ├── 江北区/
-    │   ├── SN_20261007_200148_519171.jpg
-    │   └── ...
-    ├── 未分拣/                 # 还没扫区域卡时拍的照片
-    └── _切换记录/              # 区域卡本身的照片
-```
 
 ## 设计要点与坑（踩过的）
 
@@ -175,6 +186,9 @@ Windows 上可直接双击 `cards/做区域卡.bat`，按提示输入区域名�
    落盘前用"减均值后的归一化互相关（NCC）"判断是否就是空台：空台漂移照片 0.975、
    带标签光猫 0.632、手机屏幕 0.246 —— 阈值取 0.90，空台只记日志不存图。
 9. **区域卡不留图**：卡片识别成功后直接删除照片，避免入库数据里混入卡片照片。
+10. **NAS 残留副本**：照片先落在日期根目录等分拣，若 5 分钟同步恰好扫到"路过中"的文件，
+    NAS 日期根目录会残留一份（同步只增不删）。同步已排除：数量标记 txt、`*.tmp`、
+    日期根目录里的 `SN_*.jpg`（分拣进区域文件夹后才同步）。
 
 ## 说明
 

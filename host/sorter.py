@@ -28,11 +28,14 @@ from urllib.parse import unquote
 
 import cv2
 
+import photo_count
+
 DATA_DIR = "/opt/scanner/data"
 STATE_FILE = "/opt/scanner/current_region.json"
 STATS_FILE = "/opt/scanner/region_stats.json"
 SWITCH_LOG = "/opt/scanner/region_history.log"
 SWITCH_DIR = "_切换记录"
+CARD_FAIL_DIR = "_未识别卡片"
 UNSORTED = "未分拣"
 
 CARD_RE = re.compile(r"^\s*enter\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
@@ -90,6 +93,22 @@ def log_switch(text):
             fh.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {text}\n")
     except OSError as exc:
         log(f"切换记录写入失败: {exc}")
+
+
+def frame_sharpness(frame):
+    """中心区清晰度（与采集端口径一致）."""
+    h, w = frame.shape[:2]
+    roi = frame[int(h * 0.15) : int(h * 0.85), int(w * 0.15) : int(w * 0.85)]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def frame_bright_pct(frame):
+    """中心区亮像素占比（%）."""
+    h, w = frame.shape[:2]
+    roi = frame[int(h * 0.15) : int(h * 0.85), int(w * 0.15) : int(w * 0.85)]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return float((gray > 150).mean()) * 100
 
 
 # ---------------- 二维码 ----------------
@@ -213,6 +232,7 @@ def handle_photo(path, date_dir):
         if region is None:
             dst = unique_dest(os.path.join(date_dir, SWITCH_DIR), f"无效_{name}")
             os.replace(path, dst)
+            photo_count.update_count_marker(os.path.dirname(dst))
             log(f"区域卡无效: 名字不合法或为空 -> {os.path.basename(dst)}")
             return
         if region.lower() in CANCEL_WORDS:
@@ -231,12 +251,31 @@ def handle_photo(path, date_dir):
     if any(LOOKS_LIKE_CARD.match(t) for t in texts):
         dst = unique_dest(os.path.join(date_dir, SWITCH_DIR), f"无效_{name}")
         os.replace(path, dst)
+        photo_count.update_count_marker(os.path.dirname(dst))
         log(f"区域卡无效: 无法解析内容 -> {os.path.basename(dst)}")
         return
+
+    # 没解出任何码，但画面"很亮却没有细节" —— 多半是过曝/发虚的区域卡（例如手机屏幕太亮）：
+    # 既不要混进区域文件夹，也要让操作员知道"这次切换没成功"。
+    img = cv2.imread(path)
+    if img is not None:
+        bright = frame_bright_pct(img)
+        sharp = frame_sharpness(img)
+        # 门限用 20%（实测：过曝卡片亮区 35~46%，而正常设备照片亮区一般 <15%）
+        if bright >= 20.0 and sharp < 250:
+            dst = unique_dest(os.path.join(date_dir, CARD_FAIL_DIR), f"未识别_{name}")
+            os.replace(path, dst)
+            photo_count.update_count_marker(os.path.dirname(dst))
+            log(
+                f"疑似区域卡但识别失败（亮区 {bright:.1f}%、清晰度 {sharp:.0f}：屏幕过曝或拍虚），"
+                f"已放入 {CARD_FAIL_DIR}/，请重放卡片"
+            )
+            return
 
     region = current_region() or UNSORTED
     dst = unique_dest(os.path.join(date_dir, region), name)
     os.replace(path, dst)
+    photo_count.update_count_marker(os.path.dirname(dst))
     stats_add(region)
     if region == UNSORTED:
         log(f"未选择区域, 已放入 {UNSORTED}/: {name}")
@@ -247,6 +286,7 @@ def handle_photo(path, date_dir):
 def watch_loop():
     log("区域分拣服务启动（监听新照片）")
     seen = set()
+    fails = {}
     while True:
         for date_dir in sorted(glob.glob(os.path.join(DATA_DIR, "*/"))):
             for path in sorted(glob.glob(os.path.join(date_dir, "*.jpg"))):
@@ -260,8 +300,15 @@ def watch_loop():
                 seen.add(path)
                 try:
                     handle_photo(path, date_dir)
+                    fails.pop(path, None)
                 except Exception as exc:  # noqa: BLE001
-                    log(f"处理失败 {os.path.basename(path)}: {exc}")
+                    n = fails.get(path, 0) + 1
+                    fails[path] = n
+                    if n >= 3:
+                        log(f"处理失败(重试{n}次仍不行, 先跳过) {os.path.basename(path)}: {exc}")
+                    else:
+                        log(f"处理失败(下轮重试 {n}/3) {os.path.basename(path)}: {exc}")
+                        seen.discard(path)  # 放回去下轮再试，避免照片永远卡在根目录没人管
         if len(seen) > 5000:
             seen = set(sorted(seen)[-1000:])
         time.sleep(0.7)
@@ -302,6 +349,8 @@ def cmd_move(src, dst):
     os.makedirs(dst_dir, exist_ok=True)
     for path in files:
         os.replace(path, unique_dest(dst_dir, os.path.basename(path)))
+    photo_count.update_count_marker(dst_dir)
+    photo_count.update_count_marker(src_dir)
     print(f"已把 {len(files)} 张从 {src}/ 移到 {dst}/")
     return 0
 

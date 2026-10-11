@@ -6,7 +6,7 @@
   * 每 5 分钟跑一次（由 nas-sync.timer 触发）
   * **当天**的日期目录：每轮增量同步，只补新文件，不覆盖已存在的
   * **历史**日期目录：只做一次"最终同步"，成功后在状态文件里标记 final，
-    以后**永远跳过**，不会被 5 分钟任务反复重写
+    老文件以后**永远不再重写**；冻结之后新增的文件（手机补录等）会补传一次
   * NAS 没挂载 / 同步失败：本轮跳过，不标记 final，下一轮自动重试
   * 只增不删：绝不在 NAS 上删除文件
 
@@ -56,12 +56,102 @@ def rsync(src_dir, dst_dir, dry=False):
     """
     cmd = [
         "rsync", "-rt", "--inplace", "--no-perms", "--no-owner", "--no-group",
+        "--exclude=[0-9]*.txt",
+        "--exclude=*.tmp",
+        "--exclude=/SN_*.jpg",
         "--stats", "--human-readable", src_dir + "/", dst_dir + "/",
     ]
     if dry:
         cmd.insert(1, "-n")
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     return proc.returncode, proc.stdout + proc.stderr
+
+
+def parse_ts(s):
+    """把状态文件里的 'YYYY-mm-dd HH:MM:SS' 转成时间戳；无法解析时返回 None."""
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def rsync_extra(src_dir, dst_dir, rel_paths):
+    """只补传 rel_paths 列出的文件（冻结目录的补录用）.
+
+    用 --files-from 精确点传：列表之外的文件一律不碰，
+    所以 NAS 上被手动删掉的老文件不会被"复活"。
+    """
+    cmd = [
+        "rsync", "-rt", "--inplace", "--no-perms", "--no-owner", "--no-group",
+        "--exclude=[0-9]*.txt",
+        "--exclude=*.tmp",
+        "--files-from=-", "--stats", "--human-readable",
+        src_dir + "/", dst_dir + "/",
+    ]
+    proc = subprocess.run(cmd, input="\n".join(rel_paths) + "\n",
+                          capture_output=True, text=True, timeout=1800)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def sync_new_after_freeze(day, info, src, dst):
+    """历史目录冻结后新增的文件（手机补录等）：增量补传一次，返回补传个数.
+
+    判据：文件 mtime 晚于冻结时间（info["at"]）。
+      * 冻结后新增 -> 补传；
+      * 冻结前的老文件（哪怕 NAS 上被删了）-> 一律不碰。
+    已补传过的记在 info["extra"]（相对路径 -> mtime），不会重复传。
+    """
+    freeze_ts = parse_ts(info.get("at", ""))
+    if freeze_ts is None or not os.path.isdir(src) or not os.path.isdir(dst):
+        return 0
+    extra = info.get("extra", {})
+    todo = {}
+    for dirpath, _dirs, files in os.walk(src):
+        for name in files:
+            path = os.path.join(dirpath, name)
+            try:
+                mt = round(os.path.getmtime(path), 3)
+            except OSError:
+                continue
+            if mt <= freeze_ts + 1:
+                continue  # 冻结前的老文件，永不重写
+            if re.match(r"^\d+\.txt$", name):
+                continue  # 数量标记文件（名字=图片数）不同步到 NAS
+            if name.endswith(".tmp"):
+                continue  # 写盘中的临时文件
+            rel = os.path.relpath(path, src)
+            if "/" not in rel:
+                continue  # 根目录里的都是"待分拣"路过文件，分拣进区域文件夹后再同步
+            if abs(extra.get(rel, -1) - mt) < 0.001:
+                continue  # 这个文件之前已经补传过
+            todo[rel] = mt
+    if not todo:
+        return 0
+    rels = sorted(todo)
+    rc, out = rsync_extra(src, dst, rels)
+    if rc != 0:
+        log(f"历史 {day} 补录补传失败（rsync exit={rc}）:\n{out[-800:]}")
+        return 0
+    pushed = 0
+    added_bytes = 0
+    for rel in rels:
+        sp = os.path.join(src, rel)
+        dp = os.path.join(dst, rel)
+        try:
+            if os.path.exists(dp) and os.path.getsize(dp) == os.path.getsize(sp):
+                extra[rel] = todo[rel]
+                pushed += 1
+                added_bytes += os.path.getsize(sp)
+            else:
+                log(f"历史 {day} 补传校验未通过: {rel}")
+        except OSError:
+            pass
+    if pushed:
+        info["extra"] = extra
+        info["files"] = info.get("files", 0) + pushed
+        info["bytes"] = info.get("bytes", 0) + added_bytes
+        log(f"历史 {day}: 冻结后新增 {pushed} 个补录文件已补传（老文件未动）")
+    return pushed
 
 
 def count_files(root):
@@ -104,11 +194,14 @@ def main():
         changed = False
         for day in dates:
             info = state.get(day, {})
-            if info.get("status") == "final":
-                continue  # 历史目录已冻结，永不重写
-
             src = os.path.join(SRC, day)
             dst = os.path.join(DST, day)
+            if info.get("status") == "final":
+                # 历史目录已冻结：老文件永不重写，但冻结后新增的（补录）要补传
+                if sync_new_after_freeze(day, info, src, dst):
+                    changed = True
+                continue
+
             n_local, bytes_local = count_files(src)
             kind = "当天" if day == today else ("历史" if day < today else "未来")
 

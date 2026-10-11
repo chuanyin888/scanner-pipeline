@@ -66,8 +66,34 @@ CFG = {
     "sharpness_warn": 100,    # 抓拍清晰度低于此值就提醒重标定
     "plate_bright_limit": 5.0,  # 中心区亮像素(>150)占比低于此值 且 清晰度低 = 空台
     "plate_sharp_limit": 300,   # 实测: 空底板清晰度≈124, 深色电路板≈667, 白色光猫≈1400+
-    "empty_ncc": 0.90,          # 与空台的结构相关度高于此值 且 平均差很小 => 就是空台（实测 空台0.975 / 光猫0.632 / 手机0.246）
-    "empty_mean_abs": 9.0,
+    # 空台判定：整幅 + 中间区 双重结构比对（都高于门限才算"空台"）
+    # 实测（贴了棋盘格标记之后）：
+    #   调灯/侧光梯度(±30~45)：整幅 0.968~1.000，中间 0.989~1.000  -> 空台 ✓
+    #   小设备只压住标记一小块：整幅 0.940，中间 0.793            -> 有东西 ✓
+    #   中大设备：整幅 0.745~0.854，中间 0.118~0.526             -> 有东西 ✓
+    "empty_ncc_frame": 0.95,    # 整幅结构相关度门限（防"边上放了东西"）
+    "empty_ncc_center": 0.95,   # 中间 50% 区域门限（对小设备更灵敏）
+    "plate_has_marker": True,   # 台面贴了标记：启动画面直接当空台基准（启动时台面保持空）
+    # 保存前要求"有物体特征"：清晰度≥500 或 亮区≥5%
+    # 阈值从 250 提到 500：侧光把空底板纹理照出来时清晰度可达 422（实测误拍），
+    # 而深色电路板 667、带标签设备 1000+ 仍能通过。
+    "obj_sharp_min": 500,
+    "overexp_warn_pct": 20.0,   # 中心区"死白"(≥250)占比超过此值 => 日志提醒过曝（实测正常≈0~2%，过曝≈46~62%）
+    # ---- 硬件锁定开关（默认关）----
+    # 实测本机高拍仪：手动白平衡会让画面严重偏蓝（r/g 1.01→0.55），手动曝光会严重欠曝
+    # （自动均值 94 → 手动 4~12）。所以默认不锁，改用"对亮度漂移不敏感的软件判定"。
+    # 换相机后如果手动控制正常，把下面开关打开即可。
+    "lock_wb": False,
+    "wb_temperature": 4600,
+    "lock_exposure": False,
+    "exposure_time": 300,
+    "lock_dynamic_framerate": True,   # 关掉"低光自动降帧"，让节奏稳定（不影响画质）
+    "focus_check_s": 30,        # 每 30 秒核对一次硬件里的实际焦距，被改动就自动打回去
+    # 相机亮度补偿(-64~64)。实测：贴上空台标记(棋盘格)后，标记的白色会把自动曝光拉低
+    # （底板四角亮度 -8 档时只有 2.2，而未贴标记时同档是 33.8）→ 需要 +24 才能把亮度找回来
+    # （+24 实测底板 33.7、过曝 0.3%）。现场如果换环境/换灯，可用 scannerctl 观察"过曝%"再微调。
+    "brightness_comp": 21,   # 现场微调值：+21（用户实测选定；+24 略亮、+16 略暗）
+    "bg_adapt_rate_light": 0.15,  # 纯灯光/曝光变化时，更快把新亮度并进空台背景
     # 自适应与自愈
     "bg_adapt_rate": 0.02,    # 空台时背景缓慢适应(抗灯光/落灰漂移)
     "read_fail_limit": 40,    # 连续读帧失败 -> 重连设备
@@ -198,8 +224,15 @@ def init_focus(dev, cfg=CFG, force_calibrate=False):
         if value is not None:
             set_ctrl(dev, "focus_automatic_continuous", 0)
             set_ctrl(dev, "focus_absolute", value)
+            actual = get_ctrl(dev, "focus_absolute")
+            if actual != value:
+                log(f"对焦写入未生效（想设 {value}，硬件回读 {actual}），再设一次并复核")
+                set_ctrl(dev, "focus_absolute", value)
+                actual = get_ctrl(dev, "focus_absolute")
+            if actual != value:
+                log(f"警告: 对焦值设置失败，硬件当前 {actual}（期望 {value}）")
             LOCKED_FOCUS = value
-            log(f"复用已锁定对焦值: {value} (跳过自动对焦, 零等待)")
+            log(f"复用已锁定对焦值: {value} (硬件回读 {actual}, 跳过自动对焦, 零等待)")
             return value
 
     log("对焦校准: 打开连续自动对焦, 等待收敛 ...")
@@ -231,6 +264,30 @@ def load_stored_focus(cfg=CFG):
             return int(json.load(fh)["focus_absolute"])
     except Exception:  # noqa: BLE001
         return None
+
+
+def init_camera_locks(dev, cfg=CFG):
+    """可选的硬件锁定（本机相机手动模式不可用，默认全部关闭）.
+
+    另外默认关掉"低光自动降帧"，避免帧率忽高忽低影响节奏判断。
+    """
+    if cfg.get("lock_dynamic_framerate"):
+        set_ctrl(dev, "exposure_dynamic_framerate", 0)
+    if cfg.get("brightness_comp") is not None:
+        set_ctrl(dev, "brightness", cfg["brightness_comp"])
+        log(f"亮度补偿设为 {cfg['brightness_comp']}")
+    if cfg.get("lock_wb"):
+        set_ctrl(dev, "white_balance_automatic", 0)
+        set_ctrl(dev, "white_balance_temperature", cfg["wb_temperature"])
+        log(f"白平衡已锁定 {cfg['wb_temperature']}K（注意：本机实测手动白平衡偏色）")
+    else:
+        set_ctrl(dev, "white_balance_automatic", 1)
+    if cfg.get("lock_exposure"):
+        set_ctrl(dev, "auto_exposure", 1)
+        set_ctrl(dev, "exposure_time_absolute", cfg["exposure_time"])
+        log(f"曝光已锁定 {cfg['exposure_time']}（注意：本机实测手动曝光会严重欠曝）")
+    else:
+        set_ctrl(dev, "auto_exposure", 3)
 
 
 def save_stored_focus(value, cfg=CFG):
@@ -313,6 +370,18 @@ def frame_bright_pct(frame):
     return float((gray > 150).mean()) * 100
 
 
+def frame_saturation_pct(frame):
+    """中心区"死白"像素占比（%）—— 判断过曝的真正指标.
+
+    实测同一批照片：正常 0~2%，明显过曝 46~62%；
+    而 JPEG 文件大小与过曝基本不相关（r≈0.03），因为大小主要取决于细节多少。
+    """
+    h, w = frame.shape[:2]
+    roi = frame[int(h * 0.15) : int(h * 0.85), int(w * 0.15) : int(w * 0.85)]
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    return float((gray >= 250).mean()) * 100
+
+
 def frame_is_plate(frame, cfg=CFG):
     """判断当前画面是不是空台.
 
@@ -324,24 +393,67 @@ def frame_is_plate(frame, cfg=CFG):
     return frame_sharpness(frame) < cfg["plate_sharp_limit"]
 
 
+def count_diff_norm(a, b, threshold):
+    """先各自减去平均亮度再比差异 —— 自动曝光/白平衡的漂移不会被当成"画面在动"."""
+    x = a.astype("float32")
+    y = b.astype("float32")
+    x -= float(x.mean())
+    y -= float(y.mean())
+    return int((np.abs(x - y) > threshold).sum())
+
+
+def focus_watchdog(dev, cfg=CFG):
+    """定期核对硬件里的实际焦距：被自动对焦/重枚举改掉就立刻打回锁定值.
+
+    实测踩过：焦距曾从 552 掉回出厂默认 220（相机重枚举/某些控制项写入会触发），
+    而程序只记了"我设过"，没核对硬件，于是照片全虚。
+    """
+    global LOCKED_FOCUS
+    if LOCKED_FOCUS is None or dev is None:
+        return None
+    actual = get_ctrl(dev, "focus_absolute")
+    if actual is None:
+        return None
+    if actual != LOCKED_FOCUS:
+        log(f"焦距被改动: 硬件 {actual} -> 重新写回 {LOCKED_FOCUS}")
+        set_ctrl(dev, "focus_automatic_continuous", 0)
+        set_ctrl(dev, "focus_absolute", LOCKED_FOCUS)
+        back = get_ctrl(dev, "focus_absolute")
+        log(f"焦距复核: {back}")
+        return back
+    return actual
+
+
 def is_empty_like(frame, bg, cfg=CFG):
     """判断画面是不是"就是空台"（即使自动曝光漂移导致整体亮度不同）.
 
-    做法：两边各自减去平均亮度后算归一化互相关（NCC）。
-    纯曝光/光线变化只会让亮度整体平移，NCC 依旧很高；
-    真放了东西结构就变了，NCC 会明显下降。
+    做法：两边各自减去平均亮度后算归一化互相关（NCC），看两处：
+      1) 整幅 —— 防止把东西放在边上被漏掉；
+      2) 中间 50% 区域 —— 对小物件更灵敏（小设备只压住标记一角也能发现）。
+    纯光线/侧光变化只改变亮度分布，NCC 依旧很高；放了东西结构就变，NCC 明显下降。
     """
     g = detect_view(frame, cfg)
     if g.shape != bg.shape:
         return False
-    a = g.astype("float32")
-    b = bg.astype("float32")
-    a -= float(a.mean())
-    b -= float(b.mean())
-    denom = float(np.sqrt((a * a).sum()) * np.sqrt((b * b).sum())) + 1e-6
-    ncc = float((a * b).sum()) / denom
-    mean_abs = float(np.abs(a - b).mean())
-    return ncc > cfg["empty_ncc"] and mean_abs < cfg["empty_mean_abs"]
+    if _ncc(g, bg) < cfg["empty_ncc_frame"]:
+        return False
+    return _ncc(_center_crop(g), _center_crop(bg)) > cfg["empty_ncc_center"]
+
+
+def _ncc(a, b):
+    """去均值后的归一化互相关（只看结构，不受整体亮度影响）."""
+    x = a.astype("float32")
+    y = b.astype("float32")
+    x -= float(x.mean())
+    y -= float(y.mean())
+    denom = float(np.sqrt((x * x).sum()) * np.sqrt((y * y).sum())) + 1e-6
+    return float((x * y).sum()) / denom
+
+
+def _center_crop(img, ratio=0.5):
+    h, w = img.shape[:2]
+    dy, dx = int(h * (1 - ratio) / 2), int(w * (1 - ratio) / 2)
+    return img[dy : h - dy, dx : w - dx]
 
 
 # -------------------- 写盘线程 --------------------
@@ -363,20 +475,28 @@ def writer_worker(cfg=CFG):
                 fh.write(buf.tobytes())
             os.replace(path + ".tmp", path)
             sharp = frame_sharpness(frame)
+            sat = frame_saturation_pct(frame)
             cost = (time.time() - t0) * 1000
             with STATS_LOCK:
                 STATS["captures"] += 1
                 STATS["last_capture"] = os.path.basename(path)
                 STATS["last_capture_ms"] = round(cost, 1)
                 STATS["last_sharpness"] = round(sharp, 1)
+                STATS["last_overexposed_pct"] = round(sat, 2)
             log(
                 f"抓拍完成: {path} ({os.path.getsize(path) // 1024}KB, "
-                f"写盘 {cost:.0f}ms, 清晰度 {sharp:.0f})"
+                f"写盘 {cost:.0f}ms, 清晰度 {sharp:.0f}, 过曝 {sat:.1f}%)"
             )
             if sharp < cfg["sharpness_warn"]:
                 log(
                     f"提醒: 清晰度 {sharp:.0f} 偏低(疑似失焦), "
                     "把典型设备放底板上执行 scannerctl focus 重新标定"
+                )
+            if sat >= cfg["overexp_warn_pct"]:
+                log(
+                    f"提醒: 画面过曝 {sat:.1f}%（中心区大片死白，细节会丢）—— "
+                    "把补光灯调暗/挪斜一点，或把亮度补偿调更负（当前 brightness_comp="
+                    f"{cfg.get('brightness_comp')}）"
                 )
         except Exception as exc:  # noqa: BLE001
             with STATS_LOCK:
@@ -462,6 +582,7 @@ def run_loop(cfg=CFG):
     mode = "RUN"
     hint_at = 0.0
     last_sharp_check = 0.0
+    last_focus_check = 0.0
 
     while RUNNING:
         if cap is None:
@@ -484,6 +605,7 @@ def run_loop(cfg=CFG):
             focus = init_focus(dev, cfg)
             with STATS_LOCK:
                 STATS["focus"] = focus
+            init_camera_locks(dev, cfg)
             try:
                 bg = calibrate_background(cap, cfg)
             except Exception as exc:  # noqa: BLE001
@@ -496,7 +618,12 @@ def run_loop(cfg=CFG):
             state, stable, empty_run, failed = "EMPTY", 0, 0, 0
             ok, probe = cap.read()
             probe_bright = frame_bright_pct(probe) if ok else None
-            if probe_bright is not None and probe_bright < cfg["plate_bright_limit"]:
+            if cfg.get("plate_has_marker"):
+                # 台面贴了标记：空台本身就"很亮有图案"，不能再按亮区判断，
+                # 直接把启动画面当空台基准（要求启动时台面是空的）
+                mode = "RUN"
+                log("已启用空台标记：启动画面作为空台基准（启动时台面请保持空）")
+            elif probe_bright is not None and probe_bright < cfg["plate_bright_limit"]:
                 mode = "RUN"
                 log("流水线监控就绪: 空台=等待, 放入物品静止即抓拍")
             else:
@@ -536,14 +663,24 @@ def run_loop(cfg=CFG):
         if prev is None:
             prev = gray
             continue
-        motion = count_diff(prev, gray, cfg["motion_threshold"])
+        # 帧间"是否在动"用去均值后的比较：自动曝光/白平衡漂移不再被当成晃动
+        motion = count_diff_norm(prev, gray, cfg["motion_threshold"])
         prev = gray
 
         diff_px = count_diff(bg, gray, cfg["diff_threshold"])
         has_item = diff_px > int(gray.size * cfg["item_ratio"])
         moving = motion > int(gray.size * cfg["motion_ratio"])
+        # "东西已经拿走"用结构判定（对亮度漂移免疫）；has_item 为假说明本来就匹配空台
+        empty_now = (not has_item) or is_empty_like(frame, bg, cfg)
 
         now = time.time()
+        if dev and now - last_focus_check > cfg["focus_check_s"]:
+            last_focus_check = now
+            actual_focus = focus_watchdog(dev, cfg)
+            if actual_focus is not None:
+                with STATS_LOCK:
+                    STATS["focus"] = actual_focus
+
         if mode == "WAIT_PLATE":
             # 启动时台面非空: 等出现"低纹理 + 静止"的画面, 即认为台面已清空
             if not moving and has_item:
@@ -564,14 +701,23 @@ def run_loop(cfg=CFG):
 
         if state == "EMPTY":
             if has_item:
-                state = "SETTLING"
-                stable = 0
-                log(f"检测到放入物品 (变化像素 {diff_px}), 等待静止 ...")
+                if is_empty_like(frame, bg, cfg):
+                    # 只是灯光/曝光变了（结构没变）——不算"放了东西"：
+                    # 不点亮状态灯、不进入抓拍流程，静默把新亮度并进背景
+                    if not moving:
+                        cv2.addWeighted(
+                            bg, 1 - cfg["bg_adapt_rate_light"], gray,
+                            cfg["bg_adapt_rate_light"], 0, dst=bg,
+                        )
+                else:
+                    state = "SETTLING"
+                    stable = 0
+                    log(f"检测到放入物品 (变化像素 {diff_px}), 等待静止 ...")
             elif not moving:
                 # 空台缓慢适应环境光/落灰
                 cv2.addWeighted(bg, 1 - cfg["bg_adapt_rate"], gray, cfg["bg_adapt_rate"], 0, dst=bg)
         elif state == "SETTLING":
-            if not has_item:
+            if empty_now:
                 empty_run += 1
                 if empty_run >= cfg["empty_frames"]:
                     state = "EMPTY"
@@ -583,9 +729,17 @@ def run_loop(cfg=CFG):
                 if not moving:
                     stable += 1
                     if stable >= cfg["stable_frames"] and now - last_capture >= cfg["min_capture_gap"]:
+                        sharp_now = frame_sharpness(frame)
+                        bright_now = frame_bright_pct(frame)
                         if is_empty_like(frame, bg, cfg):
                             # 空台被自动曝光漂移"伪装"成物品时不再拍下来（用户要求：空台不必留图）
                             log("画面与空台一致（曝光漂移误触发），跳过保存")
+                        elif sharp_now < cfg["obj_sharp_min"] and bright_now < cfg["plate_bright_limit"]:
+                            # 没有亮面也没有细节 => 多半是持续阴影/光线变化，不是真设备
+                            log(
+                                f"画面缺少物体特征（清晰度 {sharp_now:.0f}、亮区 {bright_now:.1f}%），"
+                                "疑似阴影/光线变化，跳过保存"
+                            )
                         else:
                             path = enqueue_capture(frame, cfg)
                             if path:
@@ -596,7 +750,7 @@ def run_loop(cfg=CFG):
                 else:
                     stable = 0
         elif state == "CAPTURED":
-            if not has_item:
+            if empty_now:
                 empty_run += 1
                 if empty_run >= cfg["empty_frames"]:
                     state = "EMPTY"
@@ -604,18 +758,6 @@ def run_loop(cfg=CFG):
                     log("空台复位完成, 可以放入下一台")
             else:
                 empty_run = 0
-                if not moving and now - last_sharp_check > 2.0:
-                    last_sharp_check = now
-                    bright = frame_bright_pct(frame)
-                    if bright < cfg["plate_bright_limit"]:
-                        log(
-                            f"当前是空台画面(亮区占比 {bright:.1f}%)但背景记录不符, "
-                            "自动重标定背景并复位"
-                        )
-                        bg = calibrate_background(cap, cfg)
-                        prev = None
-                        state, stable, empty_run = "EMPTY", 0, 0
-                        continue
 
         with STATS_LOCK:
             STATS["state"] = state

@@ -36,6 +36,7 @@ static uint32_t t0 = 0;
 static bool io2_on = false;
 
 static void setMode(Mode m) {
+    if (mode == m) return;  // 同一状态重复下发不重启动画（桥接心跳不会再让灯一直闪）
     if (mode == M_REGION && m != M_REGION) {  // 离开切换确认态时把 IO2 关掉
         pinMode(IO2_PIN, OUTPUT);
         digitalWrite(IO2_PIN, LOW);
@@ -89,11 +90,13 @@ void loop() {
         case M_WARN:  // 紫闪：亮 350ms / 灭 350ms
             if ((t % 700) < 350) ws(170, 0, 255);
             else ws(0, 0, 0);
+            if (t >= 30000) setMode(M_IDLE);  // 告警是提醒，30 秒后自动回待命
             break;
 
         case M_ERROR:  // 红白交替，各 200ms
             if ((t / 200) % 2 == 0) ws(255, 0, 0);
             else ws(255, 255, 255);
+            if (t >= 30000) setMode(M_IDLE);  // 同上：30 秒后自动回待命
             break;
 
         case M_BOOT: {  // 蓝呼吸：12 个色阶，每阶 150ms

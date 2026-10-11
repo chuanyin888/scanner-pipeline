@@ -6,3 +6,5 @@ cards/out/
 *.elf
 *.map
 data/
+app/photo-import-app/build/
+app/photo-import-app/outputs/
