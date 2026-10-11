@@ -2,6 +2,7 @@ package com.tongfa.photoimport;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.pm.PackageManager;
 import android.content.Context;
 import android.content.Intent;
@@ -106,7 +107,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("photo_import", MODE_PRIVATE);
         loadLogBuf();
-        logEvent("===== App 启动 v2.0 (vc11) 手机=" + Build.MODEL
+        logEvent("===== App 启动 v2.1 (vc12) 手机=" + Build.MODEL
                 + " 安卓=" + Build.VERSION.RELEASE);
 
         LinearLayout root = new LinearLayout(this);
@@ -167,7 +168,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         hint = new TextView(this);
         hint.setTextSize(12);
-        hint.setText("v2.0 ｜ 对着标签按「拍照」即可，拍完自动上传、马上能拍下一张");
+        hint.setText("v2.1 ｜ 对着标签按「拍照」即可，拍完自动上传、马上能拍下一张");
         root.addView(hint);
 
         LinearLayout rowSize = new LinearLayout(this);
@@ -199,7 +200,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         LinearLayout row2 = new LinearLayout(this);
         row2.setOrientation(LinearLayout.HORIZONTAL);
         Button pick = new Button(this);
-        pick.setText("相册");
+        pick.setText("相册(多选)");
         pick.setOnClickListener(new View.OnClickListener() {
             public void onClick(View v) { pickPhoto(); }
         });
@@ -406,7 +407,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
             }
             if (pv != null) p.setPreviewSize(pv.width, pv.height);
-            float viewRatio = pv != null ? (float) pv.height / pv.width : 4f / 3f;
+            // 预览流经 setDisplayOrientation(90) 竖屏显示：竖屏"高/宽"=预览的"宽/高"（长边/短边），不能写反
+            float viewRatio = pv != null ? (float) pv.width / pv.height : 4f / 3f;
             logEvent("预览尺寸: " + (pv == null ? "默认" : pv.width + "x" + pv.height));
             previewView.setAspect(viewRatio);
             final Camera.Size chosenForUi = pic;
@@ -444,6 +446,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             camera.setDisplayOrientation(90);
             camera.setPreviewDisplay(holder);
             camera.startPreview();
+            // 双保险：个别机型会静默改掉预览尺寸，读回实际值并校正取景框比例（防变形）
+            try {
+                Camera.Size actual = camera.getParameters().getPreviewSize();
+                if (pv == null || actual.width != pv.width || actual.height != pv.height) {
+                    logEvent("注意: 预览尺寸实际为 " + actual.width + "x" + actual.height);
+                }
+                pv = actual;
+                previewView.setAspect((float) actual.width / actual.height);
+            } catch (Exception ignored) {
+            }
             hint.setText("相机就绪 ｜ 对焦模式 " + p.getFocusMode()
                     + " ｜ 拍照 " + p.getPictureSize().width + "x" + p.getPictureSize().height);
             logEvent("相机就绪: 拍照 " + p.getPictureSize().width + "x" + p.getPictureSize().height
@@ -703,6 +715,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Intent it = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             it.addCategory(Intent.CATEGORY_OPENABLE);
             it.setType("image/*");
+            it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);   // 相册里可长按多选，批量上传
             startActivityForResult(it, REQ_PICK);
         } catch (Exception e) {
             toast("打开相册失败: " + e);
@@ -712,36 +725,60 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
         super.onActivityResult(req, res, data);
-        if (req != REQ_PICK || res != RESULT_OK || data == null || data.getData() == null) return;
-        final Uri uri = data.getData();
+        if (req != REQ_PICK || res != RESULT_OK || data == null) return;
         final String folder = selectedFolder();
         if (TextUtils.isEmpty(folder)) {
             toast("先选择目标文件夹");
             return;
         }
+        final List<Uri> uris = new ArrayList<Uri>();
+        ClipData cd = data.getClipData();
+        if (cd != null) {
+            for (int i = 0; i < cd.getItemCount(); i++) {
+                Uri u = cd.getItemAt(i).getUri();
+                if (u != null) uris.add(u);
+            }
+        } else if (data.getData() != null) {
+            uris.add(data.getData());
+        }
+        if (uris.isEmpty()) return;
+        logEvent("相册选择: " + uris.size() + " 张，目录=" + folder);
+        toast("已选 " + uris.size() + " 张，正在读入…");
         new Thread(new Runnable() {
             public void run() {
-                try {
-                    InputStream in = getContentResolver().openInputStream(uri);
-                    File dir = new File(getCacheDir(), "capture");
-                    if (!dir.exists()) dir.mkdirs();
-                    File f = new File(dir, "pick_" + System.currentTimeMillis() + ".jpg");
-                    FileOutputStream os = new FileOutputStream(f);
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
-                    os.close();
-                    in.close();
-                    sessionShots++;
-                    int qn;
-                    synchronized (queue) { queue.add(new Item(f, folder)); qn = queue.size(); }
-                    logEvent("相册入队: " + f.getName() + " 目录=" + folder + " 排队 " + qn);
-                    updateStats();
-                    pump();
-                } catch (Exception e) {
-                    logEvent("读取相册失败: " + e);
-                    toast("读取相册失败: " + e);
+                int okN = 0;
+                for (int i = 0; i < uris.size(); i++) {
+                    try {
+                        InputStream in = getContentResolver().openInputStream(uris.get(i));
+                        File dir = new File(getCacheDir(), "capture");
+                        if (!dir.exists()) dir.mkdirs();
+                        File f = new File(dir, "pick_" + System.currentTimeMillis() + "_" + i + ".jpg");
+                        FileOutputStream os = new FileOutputStream(f);
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                        os.close();
+                        in.close();
+                        sessionShots++;
+                        int qn;
+                        synchronized (queue) { queue.add(new Item(f, folder)); qn = queue.size(); }
+                        okN++;
+                        logEvent("相册入队: " + f.getName() + " 目录=" + folder + " 排队 " + qn);
+                    } catch (Exception e) {
+                        logEvent("读取相册第 " + (i + 1) + " 张失败: " + e);
+                    }
                 }
+                final int okFinal = okN;
+                final int total = uris.size();
+                ui.post(new Runnable() {
+                    public void run() {
+                        hint.setText(okFinal == total
+                                ? ("已加入 " + okFinal + " 张，正在上传…（可继续拍或继续选）")
+                                : ("有 " + (total - okFinal) + " 张读入失败，其余 " + okFinal + " 张正在上传"));
+                    }
+                });
+                updateStats();
+                pump();
             }
         }).start();
     }
@@ -1016,7 +1053,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             spinnerReady = true;
                             startNewBatch();
                             hint.setText(items.isEmpty() ? "服务器上没有可选文件夹"
-                                    : "目录已更新（App v2.0）");
+                                    : "目录已更新（App v2.1）");
                         }
                     });
                 } catch (final Exception e) {

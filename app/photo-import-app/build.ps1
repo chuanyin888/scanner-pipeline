@@ -61,8 +61,8 @@ $linkArgs = @(
     '--java', "$Build\gen",
     '--min-sdk-version', '24',
     '--target-sdk-version', '34',
-    '--version-code', '11',
-    '--version-name', '2.0',
+    '--version-code', '12',
+    '--version-name', '2.1',
     '-A', "$Build\assets"
 )
 & "$BuildTool\aapt2.exe" @linkArgs
@@ -102,7 +102,7 @@ if (-not $KsPass) { throw "缺少签名口令：请设置环境变量 PHOTOAPP_K
 & "$BuildTool\zipalign.exe" -f -p 4 "$Build\unsigned.apk" "$Build\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw 'zipalign failed' }
 
-$apkName = [string]([char]0x5149) + [char]0x732B + [char]0x8865 + [char]0x5F55 + '_v2.0.apk'
+$apkName = [string]([char]0x5149) + [char]0x732B + [char]0x8865 + [char]0x5F55 + '_v2.1.apk'
 $apkPath = Join-Path $OutDir $apkName
 & "$BuildTool\apksigner.bat" sign --ks $Keystore --ks-key-alias $KsAlias --ks-pass "pass:$KsPass" --key-pass "pass:$KsPass" --out $apkPath "$Build\aligned.apk"
 if ($LASTEXITCODE -ne 0) { throw 'apksigner failed' }
